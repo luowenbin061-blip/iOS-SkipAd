@@ -1,0 +1,67 @@
+# GitHub Actions 云编译流程：Windows 无 Xcode 环境下交叉编译 iOS dylib
+#
+# 原理：macOS runner 自带完整 Xcode（clang + iPhoneOS SDK + ld64），
+#       满足 trollfools-inject-dev skill 的工具链要求（chained fixups 结构）。
+#       触发后自动编译 -> 结构验证 -> 上传 artifact -> 自动发 GitHub Release（含 dylib）。
+#
+# 触发：push 到任意分支 或 手动 workflow_dispatch
+
+name: build-skipad
+
+on:
+  push:
+    paths:
+      - 'skipad.m'
+      - 'check_macho.py'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write   # 允许创建 Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 编译 dylib（Debug 带弹窗验证版）
+        run: |
+          set -euxo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "[*] SDK: $SDK"
+          clang -target arm64-apple-ios \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fobjc-exceptions \
+            -fno-stack-protector \
+            -fvisibility=hidden \
+            -dynamiclib \
+            -undefined dynamic_lookup \
+            -DENABLE_DEBUG_UI \
+            -o skipad.dylib \
+            skipad.m
+          file skipad.dylib
+
+      - name: 结构验证（chained fixups / __init_offsets / LINKEDIT）
+        run: |
+          python3 check_macho.py skipad.dylib
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipad-dylib
+          path: skipad.dylib
+          if-no-files-found: error
+
+      - name: 发布 Release（含 dylib 附件，方便直接下载）
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          gh release create "v0.1.0" skipad.dylib \
+            --repo "${{ github.repository }}" \
+            --title "SkipAd v0.1.0 (MVP 视图层)" \
+            --notes "通用开屏广告跳过插件 MVP：视图层扫描 + 关键词匹配 + 点击。注入目标：任意带开屏广告的 App（测试：电影猎手）。" \
+            --generate-notes || true
