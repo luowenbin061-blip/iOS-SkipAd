@@ -1,21 +1,24 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（第一版 MVP：视图层）
+ * skipad.m — 通用开屏广告跳过插件（v0.2 诊断版：视图层）
  *
  * 注入方式：TrollFools，目标：任何带开屏广告的 App（首个测试对象：电影猎手）
- * 机制：启动后窗口期内定时扫描所有 window 的视图树，匹配"跳过/关闭/X"等关键词，
- *       找到后触发点击（UIButton 强制 enabled + sendActions；手势视图触发 gesture）。
+ * 机制：dylib 加载后直接轮询所有 window 视图树，匹配"跳过/关闭/X"等关键词，
+ *       找到后触发点击（UIButton 强制 enabled + sendActions + target-action 兜底）。
  *
- * 工程规则（来自 trollfools-inject-dev skill 的经验，必须遵守）：
- *   1. constructor 只做日志 + 注册通知观察者，禁止调用 objc runtime / UIKit API（SIGILL）
- *   2. 全部实际逻辑在启动完成通知回调内、dispatch 到主线程执行
- *   3. 可见验证：命中"跳过"并点击成功后弹窗 1.5 秒（weak 加载失败静默无痕，必须可见验证）
- *   4. 分层信号：PLUGIN LOADED（dylib 加载）→ SCAN START（扫描启动）
- *      → SKIP HIT（真实命中并点击）→ SCAN END（窗口期结束）
+ * v0.2 改动（针对"完全没效果"的诊断）：
+ *   - 可见验证分两层：启动 1s 弹"插件已加载"（确认 dylib 是否加载）；
+ *     命中跳过弹"已跳过广告"（确认点击生效）——一次测试就能区分卡在哪层
+ *   - 扫描不再依赖 Darwin 通知（部分 App 收不到），constructor 直接 dispatch 轮询
+ *   - 通知保留作热启动补充，加防重
+ *   - 点击加 target-action 兜底（部分 SDK 按钮 sendActions 不触发）
  *
- * 已知局限（第二版再补）：
- *   - 只覆盖 UIKit 原生控件（UIButton / UILabel+手势）；Flutter/Unity/WebView 内广告走后续层
- *   - 关键词匹配为简易版，未做位置/尺寸加权评分（后续加，防误点）
- *   - 倒计时按钮处理：强制 enabled=YES 后 sendActions
+ * 工程规则（trollfools-inject-dev skill）：
+ *   - constructor 只做日志 + dispatch，不碰 UIKit/objc runtime（SIGILL）
+ *   - 全部 UI 操作在主线程、App 启动后执行
+ *
+ * 已知局限（第三版再补）：
+ *   - 只覆盖 UIKit 原生控件；Flutter/Unity/WebView 内广告走后续层
+ *   - 关键词简易匹配，未做位置/尺寸加权评分
  */
 
 #import <UIKit/UIKit.h>
@@ -26,15 +29,12 @@
 
 #define PLUGIN_TAG "SkipAd"
 
-/* ========== 诊断开关 ========== */
-/* Debug 构建弹窗（可见验证）；Release 构建去掉 -DENABLE_DEBUG_UI 即可关闭 */
 #ifdef ENABLE_DEBUG_UI
 #define UI_VISIBLE 1
 #else
 #define UI_VISIBLE 0
 #endif
 
-/* ========== 基础日志（constructor 阶段只能用 fprintf，避免 objc runtime） ========== */
 #define LOGF(fmt, ...) fprintf(stderr, "[" PLUGIN_TAG "] " fmt "\n", ##__VA_ARGS__)
 
 static void logMsg(NSString *fmt, ...) {
@@ -50,7 +50,7 @@ static BOOL kwMatch(NSString *text) {
     NSString *t = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!t.length) return NO;
 
-    /* 纯符号/短标题（"X"、"×"）：要求去掉空白后长度 <= 2，避免误匹配"XX商城" */
+    /* 纯符号/短标题（"X"、"×"）：要求去掉空白后长度 <= 2 */
     NSString *s = [t stringByReplacingOccurrencesOfString:@" " withString:@""];
     if (s.length <= 2) {
         if ([s containsString:@"×"] || [s containsString:@"X"] || [s containsString:@"x"]) {
@@ -60,26 +60,24 @@ static BOOL kwMatch(NSString *text) {
     }
 
     static NSArray *kws;
-    if (!kws) kws = @[@"跳过", @"关闭", @"Skip", @"Close", @"关闭广告", @"跳过广告"];
+    if (!kws) kws = @[@"跳过", @"关闭", @"Skip", @"Close", @"关闭广告", @"跳过广告", @"广告"];
     for (NSString *kw in kws) {
         if ([t rangeOfString:kw].location != NSNotFound) return YES;
     }
     return NO;
 }
 
-/* ========== 手势触发（UILabel/自定义视图的跳过区域） ========== */
+/* ========== 手势触发（UILabel/自定义视图） ========== */
 static BOOL triggerTapGesture(UIView *view) {
     UIView *cur = view;
     int guard = 0;
     while (cur && guard++ < 6) {
         for (UIGestureRecognizer *g in cur.gestureRecognizers) {
             if ([g isKindOfClass:[UITapGestureRecognizer class]] && g.enabled) {
-                /* 强制把手势置为 recognized，触发其 target/action */
                 @try {
                     [g setValue:@(UIGestureRecognizerStateRecognized) forKey:@"state"];
                     return YES;
                 } @catch (NSException *e) {
-                    /* state 只读：MVP 阶段放弃该手势视图，第二版用触摸合成处理 */
                     return NO;
                 }
             }
@@ -89,12 +87,31 @@ static BOOL triggerTapGesture(UIView *view) {
     return NO;
 }
 
+/* ========== 点击增强：sendActions + target-action 兜底 ========== */
+static void fireButtonClick(UIButton *btn) {
+    if (!btn.isEnabled) {
+        btn.enabled = YES;
+    }
+    [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
+
+    /* 兜底：部分广告 SDK 的按钮 sendActions 不触发，直接调注册的 target-action */
+    NSSet *targets = btn.allTargets;
+    for (id target in targets) {
+        NSArray *actions = [btn actionsForTarget:target forControlEvent:UIControlEventTouchUpInside];
+        for (NSString *selName in actions) {
+            SEL sel = NSSelectorFromString(selName);
+            if (sel) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, sel, btn);
+            }
+        }
+    }
+}
+
 /* ========== 递归扫描视图树 ========== */
 static BOOL scanViewRecursive(UIView *view, int depth) {
     if (!view || depth > 25) return NO;
     if (view.hidden || view.alpha < 0.05) return NO;
 
-    /* 1) UIButton：currentTitle / titleLabel.text / accessibilityLabel */
     if ([view isKindOfClass:[UIButton class]]) {
         UIButton *btn = (UIButton *)view;
         NSString *t = btn.currentTitle;
@@ -102,17 +119,12 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
         if (!t.length) t = btn.titleLabel.attributedText.string;
         if (!t.length) t = btn.accessibilityLabel;
         if (kwMatch(t)) {
-            /* 倒计时禁用按钮：强制 enabled 再发事件 */
-            if (!btn.isEnabled) {
-                btn.enabled = YES;
-            }
-            [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
+            fireButtonClick(btn);
             logMsg(@"SKIP HIT: clicked button [%@]", t);
             return YES;
         }
     }
 
-    /* 2) UILabel：文本匹配 + 手势 */
     if ([view isKindOfClass:[UILabel class]]) {
         UILabel *lbl = (UILabel *)view;
         NSString *t = lbl.text.length ? lbl.text : lbl.attributedText.string;
@@ -127,18 +139,16 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
         }
     }
 
-    /* 递归子视图（@try 保护枚举期视图树变动） */
     for (UIView *sub in view.subviews) {
         @try {
             if (scanViewRecursive(sub, depth + 1)) return YES;
         } @catch (NSException *e) {
-            /* 视图树遍历期间被修改，跳过该分支 */
         }
     }
     return NO;
 }
 
-/* ========== 扫描所有 window（keyWindow 已废弃，必须走 connectedScenes） ========== */
+/* ========== 扫描所有 window ========== */
 static BOOL scanAllWindows(void) {
     NSSet *scenes = [UIApplication sharedApplication].connectedScenes;
     for (UIScene *scene in scenes) {
@@ -154,8 +164,8 @@ static BOOL scanAllWindows(void) {
     return NO;
 }
 
-/* ========== 可见验证弹窗（UIAlertController，主线程调用，1.5 秒自动消失） ========== */
-static void showHitAlert(void) {
+/* ========== 弹窗工具 ========== */
+static void showAlert(NSString *msg) {
     if (!UI_VISIBLE) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *win = nil;
@@ -171,10 +181,10 @@ static void showHitAlert(void) {
         while (vc.presentedViewController) vc = vc.presentedViewController;
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"SkipAd"
-                                                                    message:@"已跳过广告（插件生效）"
+                                                                    message:msg
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [vc presentViewController:ac animated:NO completion:^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.5 * NSEC_PER_SEC),
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.8 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [ac dismissViewControllerAnimated:NO completion:nil];
             });
@@ -182,8 +192,23 @@ static void showHitAlert(void) {
     });
 }
 
-/* ========== 窗口期扫描（0.5s 间隔，冷启动 10s / 热启动 5s） ========== */
+static void showLoadedAlert(void) {
+    logMsg(@"PLUGIN LOADED visible check");
+    showAlert(@"插件已加载（等待开屏广告…）");
+}
+
+static void showHitAlert(void) {
+    logMsg(@"SKIP HIT visible check");
+    showAlert(@"已跳过广告（插件生效）");
+}
+
+/* ========== 窗口期扫描（防重） ========== */
+static BOOL gScanRunning = NO;
+
 static void startScanWindow(int maxSeconds) {
+    if (gScanRunning) return;
+    gScanRunning = YES;
+
     dispatch_async(dispatch_get_main_queue(), ^{
         __block int attempts = 0;
         const int maxAttempts = maxSeconds * 2;
@@ -192,30 +217,24 @@ static void startScanWindow(int maxSeconds) {
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tm) {
             if (scanAllWindows()) {
                 [tm invalidate];
+                gScanRunning = NO;
                 showHitAlert();
                 logMsg(@"SCAN END (hit)");
                 return;
             }
             if (++attempts >= maxAttempts) {
                 [tm invalidate];
+                gScanRunning = NO;
                 logMsg(@"SCAN END (window expired, no hit)");
             }
         }];
-        /* 首次执行等 0.3s，给 App 启动渲染留时间 */
         [timer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.3]];
     });
 }
 
-/* ========== 通知回调 ========== */
-/* Darwin 通知中心回调不保证主线程，内部必须 dispatch 主线程 */
-static void on_launch(CFNotificationCenterRef center, void *observer,
-                      CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    startScanWindow(10);
-}
-
+/* ========== 通知回调（热启动补充；冷启动由 constructor 直接驱动） ========== */
 static void on_active(CFNotificationCenterRef center, void *observer,
                       CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    /* 热启动（回前台）：也开一个短窗口，覆盖"回前台弹开屏"的 App */
     startScanWindow(5);
 }
 
@@ -224,11 +243,16 @@ __attribute__((constructor))
 static void init(void) {
     LOGF("PLUGIN LOADED");
 
-    /* 只注册通知观察者（CoreFoundation API，constructor 阶段安全） */
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL, on_launch,
-                                    CFSTR("UIApplicationDidFinishLaunchingNotification"),
-                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    /* 全部延迟到主线程执行（constructor 阶段禁止碰 UIKit/objc runtime） */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        /* 可见验证 1：确认 dylib 加载 */
+        showLoadedAlert();
+        /* 冷启动扫描：直接驱动，不依赖系统通知 */
+        startScanWindow(12);
+    });
+
+    /* 热启动（回前台弹开屏的 App） */
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, on_active,
                                     CFSTR("UIApplicationDidBecomeActiveNotification"),
