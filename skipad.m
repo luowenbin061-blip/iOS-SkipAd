@@ -1,19 +1,20 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（v1.1 修正版）
+ * skipad.m — 通用开屏广告跳过插件（v1.2：网络层拦截主路径）
  *
  * 全谱系覆盖：
+ *   L0 网络层拦截   —— hook NSURLSession，广告域名请求直接失败（广告不加载）
  *   L1 视图树点击   —— 标准/倒计时跳过按钮（UIButton sendActions + target-action / UILabel+手势）
  *   L2 WebView JS   —— H5 广告 DOM 匹配 click
  *   L3 Accessibility —— SwiftUI/自绘/部分 Flutter（activate + frame 合成触摸）
  *   L4 触摸合成     —— 环形计时等自绘控件（进程内 UITouch+UIEvent，走 hitTest 链路）
- *   L5 广告窗口关闭 —— v1.1 已禁用（误杀严重，v1.2 严格版再做）
+ *   L5 广告窗口关闭 —— v1.1 已禁用（误杀严重，v1.3 严格版再做）
  *   L6 传感器拦截   —— hook 加速度计，摇一摇/反转跳转广告失效
  *   L7 OCR 兜底     —— 截图 + Vision 识别"跳过/关闭"文字坐标 → 合成点击
  *
- * v1.1 修改（针对实机反馈：爱奇艺误报、百度网盘二次拉起）：
- *   - 禁用 L5（爱奇艺启动过渡窗被误隐藏 + 误弹"已跳过"）
- *   - 命中后不立即停：继续观察防广告二次拉起（百度网盘），最多 3 次，首次弹窗
- *   - 关键词收紧：去掉裸"广告"（防误匹配 App 正常页面）
+ * v1.2 修改（针对大厂 App / 滑屏广告 UI 层无效）：
+ *   - 新增 L0 网络层拦截：广告域名请求直接返回失败，广告不加载（主路径）
+ *   - 新增落盘诊断日志（沙盒 Documents/skipad.log）
+ *   - 保留 v1.1：L5 禁用、命中多轮观察、关键词收紧
  *
  * 工程规则（trollfools-inject-dev skill）：
  *   - constructor 只做日志 + dispatch + 轻量 hook 注册，不碰 UIKit（SIGILL）
@@ -44,6 +45,88 @@ static void logMsg(NSString *fmt, ...) {
     va_start(args, fmt);
     NSLogv([@"[" PLUGIN_TAG "] " stringByAppendingString:fmt], args);
     va_end(args);
+}
+
+/* ========== 落盘诊断日志（沙盒 Documents/skipad.log） ========== */
+static void logToFile(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    @try {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *path = [[paths.firstObject stringByAppendingPathComponent:@"skipad.log"] copy];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                          [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                         dateStyle:NSDateFormatterShortStyle
+                                                         timeStyle:NSDateFormatterMediumStyle],
+                          msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {
+    }
+}
+
+#define LOG(fmt, ...) do { logMsg(fmt, ##__VA_ARGS__); logToFile(fmt, ##__VA_ARGS__); } while (0)
+
+/* ========== L0: 网络层拦截（广告域名请求直接失败） ========== */
+static BOOL isAdRequest(NSURLRequest *req) {
+    NSString *host = req.URL.host.lowercaseString;
+    if (!host.length) return NO;
+    static NSArray *adDomains = @[
+        @"pangolin-sdk.com", @"csjplatform.com", @"pglstatp.com", @"pangle.cn",
+        @"gdt.qq.com", @"cpro.baidu.com", @"pos.baidu.com", @"cpro.cn",
+        @"ksad.ksyun.com", @"ksapisrv.com",
+        @"adservice.google.com", @"doubleclick.net", @"googleadservices.com",
+        @"mtg.com", @"inmobi.com", @"adsmogo.com", @"adview.cn",
+        @"snssdk.com", @"ibytedtos.com", @"byteimg.com"
+    ];
+    for (NSString *d in adDomains) {
+        if ([host containsString:d]) return YES;
+    }
+    return NO;
+}
+
+/* hook -[NSURLSession dataTaskWithRequest:completionHandler:]：广告请求直接失败 */
+typedef NSURLSessionDataTask *(*DataTaskWithReqIMP)(id, SEL, NSURLRequest *, id);
+static DataTaskWithReqIMP g_origDataTaskWithRequest;
+
+static NSURLSessionDataTask *hookDataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request, id completionHandler) {
+    if (request && isAdRequest(request)) {
+        LOG(@"L0 BLOCKED ad request: %@", request.URL.absoluteString);
+        NSError *err = [NSError errorWithDomain:NSURLErrorDomain
+                                           code:NSURLErrorCannotConnectToHost
+                                       userInfo:@{NSLocalizedDescriptionKey: @"blocked by SkipAd"}];
+        if (completionHandler) {
+            void (^cb)(NSData *, NSURLResponse *, NSError *) = completionHandler;
+            cb(nil, nil, err);
+        }
+        NSURLSession *session = (NSURLSession *)self;
+        NSURLSessionDataTask *dummy = [session dataTaskWithURL:[NSURL URLWithString:@"about:blank"]];
+        [dummy cancel];
+        return dummy;
+    }
+    return g_origDataTaskWithRequest(self, _cmd, request, completionHandler);
+}
+
+static void hookNSURLSession(void) {
+    Class cls = [NSURLSession class];
+    SEL sel = NSSelectorFromString(@"dataTaskWithRequest:completionHandler:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    g_origDataTaskWithRequest = (DataTaskWithReqIMP)method_getImplementation(m);
+    IMP newImp = imp_implementationWithBlock(^(id self, NSURLRequest *req, id cb) {
+        return hookDataTaskWithRequest(self, sel, req, cb);
+    });
+    method_setImplementation(m, newImp);
+    LOG(@"L0 hooked: NSURLSession dataTaskWithRequest");
 }
 
 /* ========== 关键词匹配 ========== */
@@ -201,8 +284,7 @@ static BOOL scanAccessibilityOfView(UIView *view) {
     return NO;
 }
 
-/* ========== L5: 广告窗口关闭（v1.1 已禁用——误杀严重，等 v1.2 严格版）
- * 原逻辑无差别 hidden windowLevel>normal 的窗口，爱奇艺等启动过渡窗被误杀。 */
+/* ========== L5: 广告窗口关闭（v1.1 已禁用——误杀严重，等 v1.3 严格版） ========== */
 static BOOL closeAdWindow(UIWindow *win) {
     return NO;   /* v1.1 禁用 */
 }
@@ -332,7 +414,6 @@ static BOOL scanAllWindows(void) {
         for (UIWindow *win in ws.windows) {
             @try {
                 /* L5 已禁用（v1.1） */
-                /* L1-L4: 视图树/WebView/Accessibility/触摸合成 */
                 if (scanViewRecursive(win, 0)) return YES;
             } @catch (NSException *e) {
             }
@@ -354,7 +435,7 @@ static BOOL scanAllWindows(void) {
     return NO;
 }
 
-/* ========== L6: 拦截加速度计（摇一摇/反转跳转广告失效） ========== */
+/* ========== L6: 拦截加速度计 ========== */
 static void hookCMMotionManager(void) {
     Class cls = NSClassFromString(@"CMMotionManager");
     if (!cls) return;
@@ -364,25 +445,25 @@ static void hookCMMotionManager(void) {
         Method m1 = class_getInstanceMethod(cls, sel1);
         if (m1) {
             method_setImplementation(m1, imp_implementationWithBlock(^(id self) {}));
-            logMsg(@"L6 hooked: CMMotionManager startAccelerometerUpdates");
+            LOG(@"L6 hooked: CMMotionManager startAccelerometerUpdates");
         }
         SEL sel2 = NSSelectorFromString(@"startAccelerometerUpdatesToQueue:withHandler:");
         Method m2 = class_getInstanceMethod(cls, sel2);
         if (m2) {
             method_setImplementation(m2, imp_implementationWithBlock(^(id self, id q, id h) {}));
-            logMsg(@"L6 hooked: CMMotionManager startAccelerometerUpdatesToQueue");
+            LOG(@"L6 hooked: CMMotionManager startAccelerometerUpdatesToQueue");
         }
         SEL sel3 = NSSelectorFromString(@"startDeviceMotionUpdates");
         Method m3 = class_getInstanceMethod(cls, sel3);
         if (m3) {
             method_setImplementation(m3, imp_implementationWithBlock(^(id self) {}));
-            logMsg(@"L6 hooked: CMMotionManager startDeviceMotionUpdates");
+            LOG(@"L6 hooked: CMMotionManager startDeviceMotionUpdates");
         }
         SEL sel4 = NSSelectorFromString(@"startGyroUpdates");
         Method m4 = class_getInstanceMethod(cls, sel4);
         if (m4) {
             method_setImplementation(m4, imp_implementationWithBlock(^(id self) {}));
-            logMsg(@"L6 hooked: CMMotionManager startGyroUpdates");
+            LOG(@"L6 hooked: CMMotionManager startGyroUpdates");
         }
     } @catch (NSException *e) {
         LOGF("L6 hook failed: %s", e.name.UTF8String ?: "?");
@@ -418,8 +499,7 @@ static void showHitAlert(void) {
 }
 
 /* ========== 窗口期扫描（防重） ==========
- * v1.1：命中后不立即停——广告 SDK 可能二次拉起（百度网盘实测），
- *       继续观察并再次处理，最多 3 次；首次命中弹窗，后续静默。 */
+ * v1.1：命中后不立即停——广告 SDK 可能二次拉起（百度网盘实测），最多 3 次 */
 static BOOL gScanRunning = NO;
 
 static void startScanWindow(int maxSeconds) {
@@ -430,27 +510,26 @@ static void startScanWindow(int maxSeconds) {
         __block int attempts = 0;
         __block int hitCount = 0;
         const int maxAttempts = maxSeconds * 5;
-        logMsg(@"SCAN START (window=%ds)", maxSeconds);
+        LOG(@"SCAN START (window=%ds)", maxSeconds);
 
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *tm) {
             if (scanAllWindows()) {
                 hitCount++;
                 if (hitCount == 1) {
-                    showHitAlert();   /* 首次命中弹窗验证 */
+                    showHitAlert();
                 }
-                logMsg(@"SCAN HIT #%d (watching for re-show)", hitCount);
+                LOG(@"SCAN HIT #%d (watching for re-show)", hitCount);
                 if (hitCount >= 3) {
                     [tm invalidate];
                     gScanRunning = NO;
-                    logMsg(@"SCAN END (3 hits, stop)");
+                    LOG(@"SCAN END (3 hits, stop)");
                 }
-                /* 不 invalidate：继续观察，防广告二次拉起 */
                 return;
             }
             if (++attempts >= maxAttempts) {
                 [tm invalidate];
                 gScanRunning = NO;
-                logMsg(@"SCAN END (window expired, hits=%d)", hitCount);
+                LOG(@"SCAN END (window expired, hits=%d)", hitCount);
             }
         }];
         [timer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
@@ -468,13 +547,15 @@ __attribute__((constructor))
 static void init(void) {
     LOGF("PLUGIN LOADED");
 
-    /* L6 传感器拦截：constructor 后主线程安装 */
+    /* L0 网络层 + L6 传感器：constructor 后主线程安装 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
+        LOG(@"PLUGIN LOADED (main)");
+        hookNSURLSession();
         hookCMMotionManager();
     });
 
-    /* 冷启动扫描：0.3s 启动，直接驱动不依赖通知 */
+    /* 冷启动扫描：0.3s 启动 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         startScanWindow(12);
