@@ -79,16 +79,8 @@ static BOOL triggerTapGesture(UIView *view) {
                     [g setValue:@(UIGestureRecognizerStateRecognized) forKey:@"state"];
                     return YES;
                 } @catch (NSException *e) {
-                    /* 部分版本 state 只读，尝试直接调 target-action（objc_msgSend 避免 ARC performSelector 警告） */
-                    NSArray *targets = [g valueForKey:@"_targets"];
-                    for (id t in targets) {
-                        id target = [t valueForKey:@"_target"];
-                        SEL action = (SEL)[t valueForKey:@"_action"];
-                        if (target && action) {
-                            ((void (*)(id, SEL, id))objc_msgSend)(target, action, g);
-                            return YES;
-                        }
-                    }
+                    /* state 只读：MVP 阶段放弃该手势视图，第二版用触摸合成处理 */
+                    return NO;
                 }
             }
         }
