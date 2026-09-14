@@ -1,27 +1,26 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（v0.2 诊断版：视图层）
+ * skipad.m — 通用开屏广告跳过插件（v0.3：视图层 + WebView JS + Accessibility）
  *
- * 注入方式：TrollFools，目标：任何带开屏广告的 App（首个测试对象：电影猎手）
- * 机制：dylib 加载后直接轮询所有 window 视图树，匹配"跳过/关闭/X"等关键词，
- *       找到后触发点击（UIButton 强制 enabled + sendActions + target-action 兜底）。
+ * 注入方式：TrollFools，目标：任何带开屏广告的 App（已实测生效：电影猎手）
+ * 机制：dylib 加载后直接轮询所有 window，三层识别：
+ *   L1 视图树：UIButton（sendActions + target-action 兜底）/ UILabel+手势
+ *   L2 WebView：WKWebView 注入 JS，DOM 匹配"跳过/关闭"并 click（覆盖 H5 广告）
+ *   L3 Accessibility：遍历 accessibility 树，匹配后 accessibilityActivate
+ *        （覆盖 SwiftUI / 自绘控件 / 部分 Flutter）
  *
- * v0.2 改动（针对"完全没效果"的诊断）：
- *   - 可见验证分两层：启动 1s 弹"插件已加载"（确认 dylib 是否加载）；
- *     命中跳过弹"已跳过广告"（确认点击生效）——一次测试就能区分卡在哪层
- *   - 扫描不再依赖 Darwin 通知（部分 App 收不到），constructor 直接 dispatch 轮询
- *   - 通知保留作热启动补充，加防重
- *   - 点击加 target-action 兜底（部分 SDK 按钮 sendActions 不触发）
+ * v0.3 改动：
+ *   - 去掉"插件已加载"诊断弹窗（已完成加载验证使命，减少干扰）
+ *   - 新增 WebView JS 注入层
+ *   - 新增 Accessibility 扫描层
+ *   - 命中弹窗保留（Debug 版验证用）
  *
  * 工程规则（trollfools-inject-dev skill）：
  *   - constructor 只做日志 + dispatch，不碰 UIKit/objc runtime（SIGILL）
  *   - 全部 UI 操作在主线程、App 启动后执行
- *
- * 已知局限（第三版再补）：
- *   - 只覆盖 UIKit 原生控件；Flutter/Unity/WebView 内广告走后续层
- *   - 关键词简易匹配，未做位置/尺寸加权评分
  */
 
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -50,7 +49,6 @@ static BOOL kwMatch(NSString *text) {
     NSString *t = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!t.length) return NO;
 
-    /* 纯符号/短标题（"X"、"×"）：要求去掉空白后长度 <= 2 */
     NSString *s = [t stringByReplacingOccurrencesOfString:@" " withString:@""];
     if (s.length <= 2) {
         if ([s containsString:@"×"] || [s containsString:@"X"] || [s containsString:@"x"]) {
@@ -67,7 +65,33 @@ static BOOL kwMatch(NSString *text) {
     return NO;
 }
 
-/* ========== 手势触发（UILabel/自定义视图） ========== */
+/* ========== L2: WebView JS 注入 ========== */
+static BOOL injectSkipScript(WKWebView *webView) {
+    NSString *js =
+        @"(function(){"
+         "var kws=['跳过','关闭','Skip','Close','跳过广告','关闭广告','广告'];"
+         "var els=document.querySelectorAll('*');"
+         "for(var i=0;i<els.length;i++){"
+         "var el=els[i];var t=(el.textContent||'').trim();"
+         "if(t.length>0&&t.length<24&&el.offsetParent!==null){"
+         "for(var j=0;j<kws.length;j++){"
+         "if(t.indexOf(kws[j])>=0){el.click();return 'skip:'+t;}}}}"
+         "return '';})()";
+
+    __block NSString *result = @"";
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [webView evaluateJavaScript:js completionHandler:^(id r, NSError *e) {
+            result = [r isKindOfClass:[NSString class]] ? r : @"";
+            dispatch_semaphore_signal(sem);
+        }];
+    });
+    /* 最多等 1 秒（JS 执行 + 返回），不阻塞太久 */
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC));
+    return result.length > 0;
+}
+
+/* ========== 手势触发 ========== */
 static BOOL triggerTapGesture(UIView *view) {
     UIView *cur = view;
     int guard = 0;
@@ -87,14 +111,13 @@ static BOOL triggerTapGesture(UIView *view) {
     return NO;
 }
 
-/* ========== 点击增强：sendActions + target-action 兜底 ========== */
+/* ========== 点击增强 ========== */
 static void fireButtonClick(UIButton *btn) {
     if (!btn.isEnabled) {
         btn.enabled = YES;
     }
     [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
 
-    /* 兜底：部分广告 SDK 的按钮 sendActions 不触发，直接调注册的 target-action */
     NSSet *targets = btn.allTargets;
     for (id target in targets) {
         NSArray *actions = [btn actionsForTarget:target forControlEvent:UIControlEventTouchUpInside];
@@ -107,11 +130,43 @@ static void fireButtonClick(UIButton *btn) {
     }
 }
 
+/* ========== L3: 当前 view 的 accessibility 元素扫描 ========== */
+static BOOL scanAccessibilityOfView(UIView *view) {
+    NSArray *elements = view.accessibilityElements;
+    if (!elements.count) return NO;
+
+    for (id el in elements) {
+        NSString *label = nil;
+        if ([el isKindOfClass:[UIAccessibilityElement class]]) {
+            label = ((UIAccessibilityElement *)el).accessibilityLabel;
+        } else if ([el isKindOfClass:[UIView class]]) {
+            label = ((UIView *)el).accessibilityLabel;
+        }
+        if (label.length && kwMatch(label)) {
+            if ([el respondsToSelector:@selector(accessibilityActivate)]) {
+                [el accessibilityActivate];
+                logMsg(@"SKIP HIT: accessibility activate [%@]", label);
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
 /* ========== 递归扫描视图树 ========== */
 static BOOL scanViewRecursive(UIView *view, int depth) {
     if (!view || depth > 25) return NO;
     if (view.hidden || view.alpha < 0.05) return NO;
 
+    /* L2: WebView 广告（H5 渲染，视图树内无按钮） */
+    if ([view isKindOfClass:[WKWebView class]]) {
+        if (injectSkipScript((WKWebView *)view)) {
+            logMsg(@"SKIP HIT: webview js clicked");
+            return YES;
+        }
+    }
+
+    /* L1: UIButton */
     if ([view isKindOfClass:[UIButton class]]) {
         UIButton *btn = (UIButton *)view;
         NSString *t = btn.currentTitle;
@@ -125,6 +180,7 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
         }
     }
 
+    /* L1: UILabel + 手势 */
     if ([view isKindOfClass:[UILabel class]]) {
         UILabel *lbl = (UILabel *)view;
         NSString *t = lbl.text.length ? lbl.text : lbl.attributedText.string;
@@ -138,6 +194,9 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
             return YES;
         }
     }
+
+    /* L3: accessibility 树 */
+    if (scanAccessibilityOfView(view)) return YES;
 
     for (UIView *sub in view.subviews) {
         @try {
@@ -164,8 +223,8 @@ static BOOL scanAllWindows(void) {
     return NO;
 }
 
-/* ========== 弹窗工具 ========== */
-static void showAlert(NSString *msg) {
+/* ========== 命中弹窗（Debug 验证用） ========== */
+static void showHitAlert(void) {
     if (!UI_VISIBLE) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *win = nil;
@@ -181,25 +240,15 @@ static void showAlert(NSString *msg) {
         while (vc.presentedViewController) vc = vc.presentedViewController;
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"SkipAd"
-                                                                    message:msg
+                                                                    message:@"已跳过广告（插件生效）"
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [vc presentViewController:ac animated:NO completion:^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.8 * NSEC_PER_SEC),
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.5 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [ac dismissViewControllerAnimated:NO completion:nil];
             });
         }];
     });
-}
-
-static void showLoadedAlert(void) {
-    logMsg(@"PLUGIN LOADED visible check");
-    showAlert(@"插件已加载（等待开屏广告…）");
-}
-
-static void showHitAlert(void) {
-    logMsg(@"SKIP HIT visible check");
-    showAlert(@"已跳过广告（插件生效）");
 }
 
 /* ========== 窗口期扫描（防重） ========== */
@@ -232,7 +281,7 @@ static void startScanWindow(int maxSeconds) {
     });
 }
 
-/* ========== 通知回调（热启动补充；冷启动由 constructor 直接驱动） ========== */
+/* ========== 通知回调（热启动补充） ========== */
 static void on_active(CFNotificationCenterRef center, void *observer,
                       CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     startScanWindow(5);
@@ -246,8 +295,6 @@ static void init(void) {
     /* 全部延迟到主线程执行（constructor 阶段禁止碰 UIKit/objc runtime） */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        /* 可见验证 1：确认 dylib 加载 */
-        showLoadedAlert();
         /* 冷启动扫描：直接驱动，不依赖系统通知 */
         startScanWindow(12);
     });
