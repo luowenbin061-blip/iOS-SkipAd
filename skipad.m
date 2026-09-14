@@ -1,18 +1,18 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（v0.3：视图层 + WebView JS + Accessibility）
+ * skipad.m — 通用开屏广告跳过插件（v0.4：视图层 + WebView JS + Accessibility + 时序优化）
  *
- * 注入方式：TrollFools，目标：任何带开屏广告的 App（已实测生效：电影猎手）
+ * 注入方式：TrollFools，目标：任何带开屏广告的 App（已实测生效：电影猎手等）
  * 机制：dylib 加载后直接轮询所有 window，三层识别：
  *   L1 视图树：UIButton（sendActions + target-action 兜底）/ UILabel+手势
  *   L2 WebView：WKWebView 注入 JS，DOM 匹配"跳过/关闭"并 click（覆盖 H5 广告）
  *   L3 Accessibility：遍历 accessibility 树，匹配后 accessibilityActivate
- *        （覆盖 SwiftUI / 自绘控件 / 部分 Flutter）
  *
- * v0.3 改动：
- *   - 去掉"插件已加载"诊断弹窗（已完成加载验证使命，减少干扰）
- *   - 新增 WebView JS 注入层
- *   - 新增 Accessibility 扫描层
- *   - 命中弹窗保留（Debug 版验证用）
+ * v0.4 改动（针对短倒计时广告 54321/321 错过时机）：
+ *   - 扫描启动提前：1.0s -> 0.3s
+ *   - 轮询间隔缩短：0.5s -> 0.2s，首轮 0.1s
+ *   - 广告一出现（倒计时刚开始）就能抓到按钮立即点
+ *
+ * v0.3 改动：去加载弹窗、加 WebView JS 注入、加 Accessibility 扫描
  *
  * 工程规则（trollfools-inject-dev skill）：
  *   - constructor 只做日志 + dispatch，不碰 UIKit/objc runtime（SIGILL）
@@ -251,7 +251,8 @@ static void showHitAlert(void) {
     });
 }
 
-/* ========== 窗口期扫描（防重） ========== */
+/* ========== 窗口期扫描（防重） ==========
+ * v0.4 时序优化：0.3s 启动 + 0.2s 轮询，短倒计时广告（3 2 1）也能第一时间抓到 */
 static BOOL gScanRunning = NO;
 
 static void startScanWindow(int maxSeconds) {
@@ -260,10 +261,10 @@ static void startScanWindow(int maxSeconds) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         __block int attempts = 0;
-        const int maxAttempts = maxSeconds * 2;
+        const int maxAttempts = maxSeconds * 5;   /* 0.2s 间隔 */
         logMsg(@"SCAN START (window=%ds)", maxSeconds);
 
-        NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tm) {
+        NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *tm) {
             if (scanAllWindows()) {
                 [tm invalidate];
                 gScanRunning = NO;
@@ -277,7 +278,8 @@ static void startScanWindow(int maxSeconds) {
                 logMsg(@"SCAN END (window expired, no hit)");
             }
         }];
-        [timer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.3]];
+        /* 首次执行等 0.1s */
+        [timer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     });
 }
 
@@ -292,8 +294,9 @@ __attribute__((constructor))
 static void init(void) {
     LOGF("PLUGIN LOADED");
 
-    /* 全部延迟到主线程执行（constructor 阶段禁止碰 UIKit/objc runtime） */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC),
+    /* 全部延迟到主线程执行（constructor 阶段禁止碰 UIKit/objc runtime）。
+     * v0.4：0.3s 就启动扫描（原 1.0s），短广告不晚点 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         /* 冷启动扫描：直接驱动，不依赖系统通知 */
         startScanWindow(12);
