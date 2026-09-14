@@ -2,7 +2,7 @@
 #
 # 原理：macOS runner 自带完整 Xcode（clang + iPhoneOS SDK + ld64），
 #       满足 trollfools-inject-dev skill 的工具链要求（chained fixups 结构）。
-#       触发后自动编译 -> 结构验证（非阻断）-> 上传 artifact -> 自动发 GitHub Release。
+#       触发后自动编译 -> 结构验证（非阻断）-> 上传 artifact -> 产物提交回仓库 -> 发 Release。
 #
 # 注意：结构验证脚本针对 lld 工具链定制，Apple ld64 产物部分检查项不匹配属预期，
 #       不阻断产物产出——真正的判据是实机注入测试。
@@ -23,7 +23,7 @@ jobs:
   build:
     runs-on: macos-latest
     permissions:
-      contents: write   # 允许创建 Release
+      contents: write   # 允许创建 Release 和提交产物
 
     steps:
       - name: Checkout
@@ -61,6 +61,15 @@ jobs:
           name: skipad-dylib
           path: skipad.dylib
           if-no-files-found: error
+
+      - name: 提交 dylib 到仓库（方便直接 raw 下载）
+        if: always()
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add skipad.dylib
+          git commit -m "build: skipad.dylib (CI 产物)" --allow-empty || true
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git main || true
 
       - name: 发布 Release（含 dylib 附件，方便直接下载）
         if: ${{ github.ref == 'refs/heads/main' }}
