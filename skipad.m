@@ -1,16 +1,19 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（v1.0 全盘版）
+ * skipad.m — 通用开屏广告跳过插件（v1.1 修正版）
  *
  * 全谱系覆盖：
  *   L1 视图树点击   —— 标准/倒计时跳过按钮（UIButton sendActions + target-action / UILabel+手势）
  *   L2 WebView JS   —— H5 广告 DOM 匹配 click
  *   L3 Accessibility —— SwiftUI/自绘/部分 Flutter（activate + frame 合成触摸）
  *   L4 触摸合成     —— 环形计时等自绘控件（进程内 UITouch+UIEvent，走 hitTest 链路）
- *   L5 广告窗口关闭 —— 高层级非主窗口（独立广告窗口）直接隐藏
+ *   L5 广告窗口关闭 —— v1.1 已禁用（误杀严重，v1.2 严格版再做）
  *   L6 传感器拦截   —— hook 加速度计，摇一摇/反转跳转广告失效
- *   L7 OCR 兜底     —— 截图 + Vision 识别"跳过/关闭"文字坐标 → 合成点击（图片按钮/自绘文字）
+ *   L7 OCR 兜底     —— 截图 + Vision 识别"跳过/关闭"文字坐标 → 合成点击
  *
- * 时序：0.3s 启动扫描 + 0.2s 轮询（短倒计时广告第一时间抓）
+ * v1.1 修改（针对实机反馈：爱奇艺误报、百度网盘二次拉起）：
+ *   - 禁用 L5（爱奇艺启动过渡窗被误隐藏 + 误弹"已跳过"）
+ *   - 命中后不立即停：继续观察防广告二次拉起（百度网盘），最多 3 次，首次弹窗
+ *   - 关键词收紧：去掉裸"广告"（防误匹配 App 正常页面）
  *
  * 工程规则（trollfools-inject-dev skill）：
  *   - constructor 只做日志 + dispatch + 轻量 hook 注册，不碰 UIKit（SIGILL）
@@ -58,7 +61,7 @@ static BOOL kwMatch(NSString *text) {
     }
 
     static NSArray *kws;
-    if (!kws) kws = @[@"跳过", @"关闭", @"Skip", @"Close", @"关闭广告", @"跳过广告", @"广告"];
+    if (!kws) kws = @[@"跳过", @"关闭", @"Skip", @"Close", @"关闭广告", @"跳过广告"];
     for (NSString *kw in kws) {
         if ([t rangeOfString:kw].location != NSNotFound) return YES;
     }
@@ -106,7 +109,7 @@ static void synthesizeTapOnView(UIView *view, UIWindow *window) {
 static BOOL injectSkipScript(WKWebView *webView) {
     NSString *js =
         @"(function(){"
-         "var kws=['跳过','关闭','Skip','Close','跳过广告','关闭广告','广告'];"
+         "var kws=['跳过','关闭','Skip','Close','跳过广告','关闭广告'];"
          "var els=document.querySelectorAll('*');"
          "for(var i=0;i<els.length;i++){"
          "var el=els[i];var t=(el.textContent||'').trim();"
@@ -198,22 +201,10 @@ static BOOL scanAccessibilityOfView(UIView *view) {
     return NO;
 }
 
-/* ========== L5: 广告窗口直接关闭（高层级非主窗口） ========== */
+/* ========== L5: 广告窗口关闭（v1.1 已禁用——误杀严重，等 v1.2 严格版）
+ * 原逻辑无差别 hidden windowLevel>normal 的窗口，爱奇艺等启动过渡窗被误杀。 */
 static BOOL closeAdWindow(UIWindow *win) {
-    if (win.windowLevel <= UIWindowLevelNormal) return NO;
-    NSString *cls = NSStringFromClass(win.class);
-    /* 排除键盘/系统浮层 */
-    if ([cls containsString:@"Keyboard"] || [cls containsString:@"TextEffect"]
-        || [cls containsString:@"Editing"] || [cls containsString:@"CalloutBar"]) {
-        return NO;
-    }
-    @try {
-        win.hidden = YES;
-        logMsg(@"SKIP HIT: closed ad window %@ (level=%.0f)", cls, (double)win.windowLevel);
-        return YES;
-    } @catch (NSException *e) {
-        return NO;
-    }
+    return NO;   /* v1.1 禁用 */
 }
 
 /* ========== L7: OCR 兜底（截图 + Vision 识别跳过文字 → 合成点击） ========== */
@@ -340,15 +331,14 @@ static BOOL scanAllWindows(void) {
         UIWindowScene *ws = (UIWindowScene *)scene;
         for (UIWindow *win in ws.windows) {
             @try {
-                /* L5: 独立广告窗口直接关闭 */
-                if (closeAdWindow(win)) return YES;
+                /* L5 已禁用（v1.1） */
                 /* L1-L4: 视图树/WebView/Accessibility/触摸合成 */
                 if (scanViewRecursive(win, 0)) return YES;
             } @catch (NSException *e) {
             }
         }
     }
-    /* L7: OCR 兜底（L1-L5 全失败时，用主 window 截图识别） */
+    /* L7: OCR 兜底 */
     for (UIScene *scene in scenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         UIWindowScene *ws = (UIWindowScene *)scene;
@@ -370,28 +360,24 @@ static void hookCMMotionManager(void) {
     if (!cls) return;
 
     @try {
-        /* startAccelerometerUpdates: 置空 */
         SEL sel1 = NSSelectorFromString(@"startAccelerometerUpdates");
         Method m1 = class_getInstanceMethod(cls, sel1);
         if (m1) {
             method_setImplementation(m1, imp_implementationWithBlock(^(id self) {}));
             logMsg(@"L6 hooked: CMMotionManager startAccelerometerUpdates");
         }
-        /* startAccelerometerUpdatesToQueue:withHandler: 置空 */
         SEL sel2 = NSSelectorFromString(@"startAccelerometerUpdatesToQueue:withHandler:");
         Method m2 = class_getInstanceMethod(cls, sel2);
         if (m2) {
             method_setImplementation(m2, imp_implementationWithBlock(^(id self, id q, id h) {}));
             logMsg(@"L6 hooked: CMMotionManager startAccelerometerUpdatesToQueue");
         }
-        /* startDeviceMotionUpdates: 置空（部分 SDK 用这个） */
         SEL sel3 = NSSelectorFromString(@"startDeviceMotionUpdates");
         Method m3 = class_getInstanceMethod(cls, sel3);
         if (m3) {
             method_setImplementation(m3, imp_implementationWithBlock(^(id self) {}));
             logMsg(@"L6 hooked: CMMotionManager startDeviceMotionUpdates");
         }
-        /* startGyroUpdates: 置空 */
         SEL sel4 = NSSelectorFromString(@"startGyroUpdates");
         Method m4 = class_getInstanceMethod(cls, sel4);
         if (m4) {
@@ -431,7 +417,9 @@ static void showHitAlert(void) {
     });
 }
 
-/* ========== 窗口期扫描（防重） ========== */
+/* ========== 窗口期扫描（防重） ==========
+ * v1.1：命中后不立即停——广告 SDK 可能二次拉起（百度网盘实测），
+ *       继续观察并再次处理，最多 3 次；首次命中弹窗，后续静默。 */
 static BOOL gScanRunning = NO;
 
 static void startScanWindow(int maxSeconds) {
@@ -440,21 +428,29 @@ static void startScanWindow(int maxSeconds) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         __block int attempts = 0;
+        __block int hitCount = 0;
         const int maxAttempts = maxSeconds * 5;
         logMsg(@"SCAN START (window=%ds)", maxSeconds);
 
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *tm) {
             if (scanAllWindows()) {
-                [tm invalidate];
-                gScanRunning = NO;
-                showHitAlert();
-                logMsg(@"SCAN END (hit)");
+                hitCount++;
+                if (hitCount == 1) {
+                    showHitAlert();   /* 首次命中弹窗验证 */
+                }
+                logMsg(@"SCAN HIT #%d (watching for re-show)", hitCount);
+                if (hitCount >= 3) {
+                    [tm invalidate];
+                    gScanRunning = NO;
+                    logMsg(@"SCAN END (3 hits, stop)");
+                }
+                /* 不 invalidate：继续观察，防广告二次拉起 */
                 return;
             }
             if (++attempts >= maxAttempts) {
                 [tm invalidate];
                 gScanRunning = NO;
-                logMsg(@"SCAN END (window expired, no hit)");
+                logMsg(@"SCAN END (window expired, hits=%d)", hitCount);
             }
         }];
         [timer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
@@ -472,7 +468,7 @@ __attribute__((constructor))
 static void init(void) {
     LOGF("PLUGIN LOADED");
 
-    /* L6 传感器拦截：constructor 后主线程安装（CMMotionManager hook 用 runtime，安全） */
+    /* L6 传感器拦截：constructor 后主线程安装 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         hookCMMotionManager();
