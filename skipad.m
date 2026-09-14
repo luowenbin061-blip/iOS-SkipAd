@@ -1,24 +1,25 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（v0.5：四层识别 + 触摸合成）
+ * skipad.m — 通用开屏广告跳过插件（v1.0 全盘版）
  *
- * 注入方式：TrollFools，目标：任何带开屏广告的 App（已实测生效：电影猎手等）
- * 机制：dylib 加载后直接轮询所有 window，四层识别：
- *   L1 视图树：UIButton（sendActions + target-action）/ UILabel+手势
- *   L2 WebView：WKWebView 注入 JS（H5 广告）
- *   L3 Accessibility：accessibilityActivate + frame 合成触摸
- *   L4 触摸合成：进程内 UITouch+UIEvent，对自绘/环形/特殊控件兜底
+ * 全谱系覆盖：
+ *   L1 视图树点击   —— 标准/倒计时跳过按钮（UIButton sendActions + target-action / UILabel+手势）
+ *   L2 WebView JS   —— H5 广告 DOM 匹配 click
+ *   L3 Accessibility —— SwiftUI/自绘/部分 Flutter（activate + frame 合成触摸）
+ *   L4 触摸合成     —— 环形计时等自绘控件（进程内 UITouch+UIEvent，走 hitTest 链路）
+ *   L5 广告窗口关闭 —— 高层级非主窗口（独立广告窗口）直接隐藏
+ *   L6 传感器拦截   —— hook 加速度计，摇一摇/反转跳转广告失效
+ *   L7 OCR 兜底     —— 截图 + Vision 识别"跳过/关闭"文字坐标 → 合成点击（图片按钮/自绘文字）
  *
- * v0.5 改动：新增 L4 触摸合成层（环形计时等自绘控件可点但 sendActions 不吃）
- * v0.4 改动：扫描时序优化（0.3s 启动 + 0.2s 轮询）
- * v0.3 改动：去加载弹窗、加 WebView JS、加 Accessibility
+ * 时序：0.3s 启动扫描 + 0.2s 轮询（短倒计时广告第一时间抓）
  *
  * 工程规则（trollfools-inject-dev skill）：
- *   - constructor 只做日志 + dispatch，不碰 UIKit/objc runtime（SIGILL）
+ *   - constructor 只做日志 + dispatch + 轻量 hook 注册，不碰 UIKit（SIGILL）
  *   - 全部 UI 操作在主线程、App 启动后执行
  */
 
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <Vision/Vision.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -64,35 +65,7 @@ static BOOL kwMatch(NSString *text) {
     return NO;
 }
 
-/* ========== L2: WebView JS 注入 ========== */
-static BOOL injectSkipScript(WKWebView *webView) {
-    NSString *js =
-        @"(function(){"
-         "var kws=['跳过','关闭','Skip','Close','跳过广告','关闭广告','广告'];"
-         "var els=document.querySelectorAll('*');"
-         "for(var i=0;i<els.length;i++){"
-         "var el=els[i];var t=(el.textContent||'').trim();"
-         "if(t.length>0&&t.length<24&&el.offsetParent!==null){"
-         "for(var j=0;j<kws.length;j++){"
-         "if(t.indexOf(kws[j])>=0){el.click();return 'skip:'+t;}}}}"
-         "return '';})()";
-
-    __block NSString *result = @"";
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [webView evaluateJavaScript:js completionHandler:^(id r, NSError *e) {
-            result = [r isKindOfClass:[NSString class]] ? r : @"";
-            dispatch_semaphore_signal(sem);
-        }];
-    });
-    /* 最多等 1 秒（JS 执行 + 返回），不阻塞太久 */
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC));
-    return result.length > 0;
-}
-
-/* ========== L4: 触摸合成（进程内 UITouch+UIEvent）
- * 对自绘/特殊控件（环形跳过等），sendActions/手势/activate 都不吃时，
- * 用坐标合成真实触摸，走系统 hitTest 链路。全部 @try 保护，失败静默。 */
+/* ========== L4: 触摸合成（进程内 UITouch+UIEvent） ========== */
 static void synthesizeTapAtPoint(CGPoint point, UIWindow *window) {
     if (!window) return;
     UIView *hitView = [window hitTest:point withEvent:nil];
@@ -119,16 +92,39 @@ static void synthesizeTapAtPoint(CGPoint point, UIWindow *window) {
         logMsg(@"SKIP HIT: synthesized tap at (%.0f,%.0f) on %@",
                point.x, point.y, NSStringFromClass(hitView.class));
     } @catch (NSException *e) {
-        /* 私有 ivar 版本差异，静默 */
     }
 }
 
 static void synthesizeTapOnView(UIView *view, UIWindow *window) {
     CGRect f = view.frame;
     CGPoint center = CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f));
-    /* frame 是相对父视图坐标，转 window 坐标 */
     CGPoint winPoint = [view convertPoint:center toView:window];
     synthesizeTapAtPoint(winPoint, window);
+}
+
+/* ========== L2: WebView JS 注入 ========== */
+static BOOL injectSkipScript(WKWebView *webView) {
+    NSString *js =
+        @"(function(){"
+         "var kws=['跳过','关闭','Skip','Close','跳过广告','关闭广告','广告'];"
+         "var els=document.querySelectorAll('*');"
+         "for(var i=0;i<els.length;i++){"
+         "var el=els[i];var t=(el.textContent||'').trim();"
+         "if(t.length>0&&t.length<24&&el.offsetParent!==null){"
+         "for(var j=0;j<kws.length;j++){"
+         "if(t.indexOf(kws[j])>=0){el.click();return 'skip:'+t;}}}}}"
+         "return '';})()";
+
+    __block NSString *result = @"";
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [webView evaluateJavaScript:js completionHandler:^(id r, NSError *e) {
+            result = [r isKindOfClass:[NSString class]] ? r : @"";
+            dispatch_semaphore_signal(sem);
+        }];
+    });
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC));
+    return result.length > 0;
 }
 
 /* ========== 手势触发 ========== */
@@ -170,7 +166,7 @@ static void fireButtonClick(UIButton *btn) {
     }
 }
 
-/* ========== L3: 当前 view 的 accessibility 元素扫描 ========== */
+/* ========== L3: accessibility 扫描 ========== */
 static BOOL scanAccessibilityOfView(UIView *view) {
     NSArray *elements = view.accessibilityElements;
     if (!elements.count) return NO;
@@ -189,7 +185,6 @@ static BOOL scanAccessibilityOfView(UIView *view) {
                     return YES;
                 }
             }
-            /* L4 兜底：accessibility frame 中心合成触摸 */
             CGRect af = [el accessibilityFrame];
             CGPoint c = CGPointMake(CGRectGetMidX(af), CGRectGetMidY(af));
             UIWindow *w = view.window;
@@ -203,12 +198,79 @@ static BOOL scanAccessibilityOfView(UIView *view) {
     return NO;
 }
 
+/* ========== L5: 广告窗口直接关闭（高层级非主窗口） ========== */
+static BOOL closeAdWindow(UIWindow *win) {
+    if (win.windowLevel <= UIWindowLevelNormal) return NO;
+    NSString *cls = NSStringFromClass(win.class);
+    /* 排除键盘/系统浮层 */
+    if ([cls containsString:@"Keyboard"] || [cls containsString:@"TextEffect"]
+        || [cls containsString:@"Editing"] || [cls containsString:@"CalloutBar"]) {
+        return NO;
+    }
+    @try {
+        win.hidden = YES;
+        logMsg(@"SKIP HIT: closed ad window %@ (level=%.0f)", cls, (double)win.windowLevel);
+        return YES;
+    } @catch (NSException *e) {
+        return NO;
+    }
+}
+
+/* ========== L7: OCR 兜底（截图 + Vision 识别跳过文字 → 合成点击） ========== */
+static BOOL gOcrCooldown = NO;   /* 防 OCR 频繁触发 */
+static int  gOcrCount = 0;
+
+static BOOL ocrFindAndTap(UIWindow *window) {
+    if (!window || window.hidden) return NO;
+    if (gOcrCooldown) return NO;
+    if (gOcrCount >= 6) return NO;   /* 窗口期最多 6 次 */
+    gOcrCooldown = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ gOcrCooldown = NO; });
+
+    UIGraphicsImageRenderer *renderer =
+        [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
+    UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
+    }];
+    if (!img) return NO;
+
+    __block BOOL hit = NO;
+    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *request, NSError *error) {
+        for (VNRecognizedTextObservation *obs in request.results) {
+            VNRecognizedText *top = [obs topCandidates:1].firstObject;
+            if (!top) continue;
+            if (kwMatch(top.string)) {
+                CGRect bbox = obs.boundingBox;   /* 归一化，左下原点 */
+                CGFloat w = window.bounds.size.width;
+                CGFloat h = window.bounds.size.height;
+                CGFloat x = bbox.origin.x * w;
+                CGFloat y = (1.0 - bbox.origin.y - bbox.size.height) * h;
+                CGPoint p = CGPointMake(x + bbox.size.width * w / 2,
+                                        y + bbox.size.height * h / 2);
+                synthesizeTapAtPoint(p, window);
+                logMsg(@"SKIP HIT: OCR [%@] -> tap (%.0f,%.0f)", top.string, p.x, p.y);
+                hit = YES;
+                break;
+            }
+        }
+    }];
+    req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+    req.recognitionLanguages = @[@"zh-Hans", @"en"];
+
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
+    NSError *err = nil;
+    [handler performRequests:@[req] error:&err];
+    if (hit) gOcrCount++;
+    return hit;
+}
+
 /* ========== 递归扫描视图树 ========== */
 static BOOL scanViewRecursive(UIView *view, int depth) {
     if (!view || depth > 25) return NO;
     if (view.hidden || view.alpha < 0.05) return NO;
 
-    /* L2: WebView 广告（H5 渲染，视图树内无按钮） */
+    /* L2: WebView 广告 */
     if ([view isKindOfClass:[WKWebView class]]) {
         if (injectSkipScript((WKWebView *)view)) {
             logMsg(@"SKIP HIT: webview js clicked");
@@ -225,7 +287,6 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
         if (!t.length) t = btn.accessibilityLabel;
         if (kwMatch(t)) {
             fireButtonClick(btn);
-            /* L4 兜底：部分自绘/特殊按钮 sendActions 不响应，合成触摸点一次 */
             if (btn.window) synthesizeTapOnView(btn, btn.window);
             logMsg(@"SKIP HIT: clicked button [%@]", t);
             return YES;
@@ -241,7 +302,6 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
                 logMsg(@"SKIP HIT: triggered gesture on label [%@]", t);
                 return YES;
             }
-            /* L4 兜底：手势触发失败（state 只读等），合成触摸 */
             if (lbl.window) {
                 synthesizeTapOnView(lbl, lbl.window);
                 logMsg(@"SKIP HIT: synthesized tap on label [%@]", t);
@@ -280,12 +340,67 @@ static BOOL scanAllWindows(void) {
         UIWindowScene *ws = (UIWindowScene *)scene;
         for (UIWindow *win in ws.windows) {
             @try {
+                /* L5: 独立广告窗口直接关闭 */
+                if (closeAdWindow(win)) return YES;
+                /* L1-L4: 视图树/WebView/Accessibility/触摸合成 */
                 if (scanViewRecursive(win, 0)) return YES;
             } @catch (NSException *e) {
             }
         }
     }
+    /* L7: OCR 兜底（L1-L5 全失败时，用主 window 截图识别） */
+    for (UIScene *scene in scenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        UIWindow *mainWin = nil;
+        for (UIWindow *win in ws.windows) {
+            if (win.windowLevel <= UIWindowLevelNormal && !win.hidden) {
+                mainWin = win;
+                break;
+            }
+        }
+        if (mainWin && ocrFindAndTap(mainWin)) return YES;
+    }
     return NO;
+}
+
+/* ========== L6: 拦截加速度计（摇一摇/反转跳转广告失效） ========== */
+static void hookCMMotionManager(void) {
+    Class cls = NSClassFromString(@"CMMotionManager");
+    if (!cls) return;
+
+    @try {
+        /* startAccelerometerUpdates: 置空 */
+        SEL sel1 = NSSelectorFromString(@"startAccelerometerUpdates");
+        Method m1 = class_getInstanceMethod(cls, sel1);
+        if (m1) {
+            method_setImplementation(m1, imp_implementationWithBlock(^(id self) {}));
+            logMsg(@"L6 hooked: CMMotionManager startAccelerometerUpdates");
+        }
+        /* startAccelerometerUpdatesToQueue:withHandler: 置空 */
+        SEL sel2 = NSSelectorFromString(@"startAccelerometerUpdatesToQueue:withHandler:");
+        Method m2 = class_getInstanceMethod(cls, sel2);
+        if (m2) {
+            method_setImplementation(m2, imp_implementationWithBlock(^(id self, id q, id h) {}));
+            logMsg(@"L6 hooked: CMMotionManager startAccelerometerUpdatesToQueue");
+        }
+        /* startDeviceMotionUpdates: 置空（部分 SDK 用这个） */
+        SEL sel3 = NSSelectorFromString(@"startDeviceMotionUpdates");
+        Method m3 = class_getInstanceMethod(cls, sel3);
+        if (m3) {
+            method_setImplementation(m3, imp_implementationWithBlock(^(id self) {}));
+            logMsg(@"L6 hooked: CMMotionManager startDeviceMotionUpdates");
+        }
+        /* startGyroUpdates: 置空 */
+        SEL sel4 = NSSelectorFromString(@"startGyroUpdates");
+        Method m4 = class_getInstanceMethod(cls, sel4);
+        if (m4) {
+            method_setImplementation(m4, imp_implementationWithBlock(^(id self) {}));
+            logMsg(@"L6 hooked: CMMotionManager startGyroUpdates");
+        }
+    } @catch (NSException *e) {
+        LOGF("L6 hook failed: %s", e.name.UTF8String ?: "?");
+    }
 }
 
 /* ========== 命中弹窗（Debug 验证用） ========== */
@@ -316,8 +431,7 @@ static void showHitAlert(void) {
     });
 }
 
-/* ========== 窗口期扫描（防重） ==========
- * v0.4 时序优化：0.3s 启动 + 0.2s 轮询，短倒计时广告（3 2 1）也能第一时间抓到 */
+/* ========== 窗口期扫描（防重） ========== */
 static BOOL gScanRunning = NO;
 
 static void startScanWindow(int maxSeconds) {
@@ -326,7 +440,7 @@ static void startScanWindow(int maxSeconds) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         __block int attempts = 0;
-        const int maxAttempts = maxSeconds * 5;   /* 0.2s 间隔 */
+        const int maxAttempts = maxSeconds * 5;
         logMsg(@"SCAN START (window=%ds)", maxSeconds);
 
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *tm) {
@@ -343,7 +457,6 @@ static void startScanWindow(int maxSeconds) {
                 logMsg(@"SCAN END (window expired, no hit)");
             }
         }];
-        /* 首次执行等 0.1s */
         [timer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     });
 }
@@ -359,15 +472,19 @@ __attribute__((constructor))
 static void init(void) {
     LOGF("PLUGIN LOADED");
 
-    /* 全部延迟到主线程执行（constructor 阶段禁止碰 UIKit/objc runtime）。
-     * v0.4：0.3s 就启动扫描（原 1.0s），短广告不晚点 */
+    /* L6 传感器拦截：constructor 后主线程安装（CMMotionManager hook 用 runtime，安全） */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        hookCMMotionManager();
+    });
+
+    /* 冷启动扫描：0.3s 启动，直接驱动不依赖通知 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        /* 冷启动扫描：直接驱动，不依赖系统通知 */
         startScanWindow(12);
     });
 
-    /* 热启动（回前台弹开屏的 App） */
+    /* 热启动 */
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, on_active,
                                     CFSTR("UIApplicationDidBecomeActiveNotification"),
