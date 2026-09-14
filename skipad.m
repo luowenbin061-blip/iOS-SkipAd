@@ -79,13 +79,13 @@ static BOOL triggerTapGesture(UIView *view) {
                     [g setValue:@(UIGestureRecognizerStateRecognized) forKey:@"state"];
                     return YES;
                 } @catch (NSException *e) {
-                    /* 部分版本 state 只读，尝试直接调 target-action */
+                    /* 部分版本 state 只读，尝试直接调 target-action（objc_msgSend 避免 ARC performSelector 警告） */
                     NSArray *targets = [g valueForKey:@"_targets"];
                     for (id t in targets) {
                         id target = [t valueForKey:@"_target"];
                         SEL action = (SEL)[t valueForKey:@"_action"];
                         if (target && action) {
-                            [target performSelector:action withObject:g];
+                            ((void (*)(id, SEL, id))objc_msgSend)(target, action, g);
                             return YES;
                         }
                     }
@@ -148,7 +148,7 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
 
 /* ========== 扫描所有 window（keyWindow 已废弃，必须走 connectedScenes） ========== */
 static BOOL scanAllWindows(void) {
-    NSArray *scenes = [UIApplication sharedApplication].connectedScenes;
+    NSSet *scenes = [UIApplication sharedApplication].connectedScenes;
     for (UIScene *scene in scenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         UIWindowScene *ws = (UIWindowScene *)scene;
@@ -162,20 +162,31 @@ static BOOL scanAllWindows(void) {
     return NO;
 }
 
-/* ========== 可见验证弹窗（UIAlertView，主线程调用，1.5 秒自动消失） ========== */
+/* ========== 可见验证弹窗（UIAlertController，主线程调用，1.5 秒自动消失） ========== */
 static void showHitAlert(void) {
     if (!UI_VISIBLE) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertView *av = [[UIAlertView alloc] initWithTitle:@"SkipAd"
-                                                     message:@"已跳过广告（插件生效）"
-                                                    delegate:nil
-                                           cancelButtonTitle:nil
-                                           otherButtonTitles:nil];
-        [av show];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.5 * NSEC_PER_SEC),
-                       dispatch_get_main_queue(), ^{
-            [av dismissWithClickedButtonIndex:0 animated:NO];
-        });
+        UIWindow *win = nil;
+        NSSet *scenes = [UIApplication sharedApplication].connectedScenes;
+        for (UIScene *scene in scenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                win = [(UIWindowScene *)scene windows].firstObject;
+                if (win) break;
+            }
+        }
+        UIViewController *vc = win.rootViewController;
+        if (!vc) return;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"SkipAd"
+                                                                    message:@"已跳过广告（插件生效）"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [vc presentViewController:ac animated:NO completion:^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.5 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                [ac dismissViewControllerAnimated:NO completion:nil];
+            });
+        }];
     });
 }
 
