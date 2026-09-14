@@ -1,18 +1,16 @@
 /*
- * skipad.m — 通用开屏广告跳过插件（v0.4：视图层 + WebView JS + Accessibility + 时序优化）
+ * skipad.m — 通用开屏广告跳过插件（v0.5：四层识别 + 触摸合成）
  *
  * 注入方式：TrollFools，目标：任何带开屏广告的 App（已实测生效：电影猎手等）
- * 机制：dylib 加载后直接轮询所有 window，三层识别：
- *   L1 视图树：UIButton（sendActions + target-action 兜底）/ UILabel+手势
- *   L2 WebView：WKWebView 注入 JS，DOM 匹配"跳过/关闭"并 click（覆盖 H5 广告）
- *   L3 Accessibility：遍历 accessibility 树，匹配后 accessibilityActivate
+ * 机制：dylib 加载后直接轮询所有 window，四层识别：
+ *   L1 视图树：UIButton（sendActions + target-action）/ UILabel+手势
+ *   L2 WebView：WKWebView 注入 JS（H5 广告）
+ *   L3 Accessibility：accessibilityActivate + frame 合成触摸
+ *   L4 触摸合成：进程内 UITouch+UIEvent，对自绘/环形/特殊控件兜底
  *
- * v0.4 改动（针对短倒计时广告 54321/321 错过时机）：
- *   - 扫描启动提前：1.0s -> 0.3s
- *   - 轮询间隔缩短：0.5s -> 0.2s，首轮 0.1s
- *   - 广告一出现（倒计时刚开始）就能抓到按钮立即点
- *
- * v0.3 改动：去加载弹窗、加 WebView JS 注入、加 Accessibility 扫描
+ * v0.5 改动：新增 L4 触摸合成层（环形计时等自绘控件可点但 sendActions 不吃）
+ * v0.4 改动：扫描时序优化（0.3s 启动 + 0.2s 轮询）
+ * v0.3 改动：去加载弹窗、加 WebView JS、加 Accessibility
  *
  * 工程规则（trollfools-inject-dev skill）：
  *   - constructor 只做日志 + dispatch，不碰 UIKit/objc runtime（SIGILL）
@@ -21,6 +19,7 @@
 
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -91,6 +90,47 @@ static BOOL injectSkipScript(WKWebView *webView) {
     return result.length > 0;
 }
 
+/* ========== L4: 触摸合成（进程内 UITouch+UIEvent）
+ * 对自绘/特殊控件（环形跳过等），sendActions/手势/activate 都不吃时，
+ * 用坐标合成真实触摸，走系统 hitTest 链路。全部 @try 保护，失败静默。 */
+static void synthesizeTapAtPoint(CGPoint point, UIWindow *window) {
+    if (!window) return;
+    UIView *hitView = [window hitTest:point withEvent:nil];
+    if (!hitView) return;
+
+    @try {
+        UITouch *touch = [[UITouch alloc] init];
+        [touch setValue:@(UITouchPhaseBegan) forKey:@"phase"];
+        [touch setValue:[NSValue valueWithCGPoint:point] forKey:@"_locationInWindow"];
+        [touch setValue:[NSValue valueWithCGPoint:point] forKey:@"_previousLocationInWindow"];
+        [touch setValue:window forKey:@"_window"];
+        [touch setValue:hitView forKey:@"_view"];
+        [touch setValue:@(1) forKey:@"tapCount"];
+        [touch setValue:@(CACurrentMediaTime()) forKey:@"_timestamp"];
+        [touch setValue:@(YES) forKey:@"_isTap"];
+
+        UIEvent *event = [[UIEvent alloc] init];
+        [event setValue:@(0) forKey:@"_type"];
+        NSSet *touches = [NSSet setWithObject:touch];
+
+        [hitView touchesBegan:touches withEvent:event];
+        [touch setValue:@(UITouchPhaseEnded) forKey:@"phase"];
+        [hitView touchesEnded:touches withEvent:event];
+        logMsg(@"SKIP HIT: synthesized tap at (%.0f,%.0f) on %@",
+               point.x, point.y, NSStringFromClass(hitView.class));
+    } @catch (NSException *e) {
+        /* 私有 ivar 版本差异，静默 */
+    }
+}
+
+static void synthesizeTapOnView(UIView *view, UIWindow *window) {
+    CGRect f = view.frame;
+    CGPoint center = CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f));
+    /* frame 是相对父视图坐标，转 window 坐标 */
+    CGPoint winPoint = [view convertPoint:center toView:window];
+    synthesizeTapAtPoint(winPoint, window);
+}
+
 /* ========== 手势触发 ========== */
 static BOOL triggerTapGesture(UIView *view) {
     UIView *cur = view;
@@ -144,8 +184,18 @@ static BOOL scanAccessibilityOfView(UIView *view) {
         }
         if (label.length && kwMatch(label)) {
             if ([el respondsToSelector:@selector(accessibilityActivate)]) {
-                [el accessibilityActivate];
-                logMsg(@"SKIP HIT: accessibility activate [%@]", label);
+                if ([el accessibilityActivate]) {
+                    logMsg(@"SKIP HIT: accessibility activate [%@]", label);
+                    return YES;
+                }
+            }
+            /* L4 兜底：accessibility frame 中心合成触摸 */
+            CGRect af = [el accessibilityFrame];
+            CGPoint c = CGPointMake(CGRectGetMidX(af), CGRectGetMidY(af));
+            UIWindow *w = view.window;
+            if (w) {
+                synthesizeTapAtPoint(c, w);
+                logMsg(@"SKIP HIT: accessibility synthesized tap [%@]", label);
                 return YES;
             }
         }
@@ -175,6 +225,8 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
         if (!t.length) t = btn.accessibilityLabel;
         if (kwMatch(t)) {
             fireButtonClick(btn);
+            /* L4 兜底：部分自绘/特殊按钮 sendActions 不响应，合成触摸点一次 */
+            if (btn.window) synthesizeTapOnView(btn, btn.window);
             logMsg(@"SKIP HIT: clicked button [%@]", t);
             return YES;
         }
@@ -184,13 +236,26 @@ static BOOL scanViewRecursive(UIView *view, int depth) {
     if ([view isKindOfClass:[UILabel class]]) {
         UILabel *lbl = (UILabel *)view;
         NSString *t = lbl.text.length ? lbl.text : lbl.attributedText.string;
-        if (kwMatch(t) && triggerTapGesture(lbl)) {
-            logMsg(@"SKIP HIT: triggered gesture on label [%@]", t);
-            return YES;
+        if (kwMatch(t)) {
+            if (triggerTapGesture(lbl)) {
+                logMsg(@"SKIP HIT: triggered gesture on label [%@]", t);
+                return YES;
+            }
+            /* L4 兜底：手势触发失败（state 只读等），合成触摸 */
+            if (lbl.window) {
+                synthesizeTapOnView(lbl, lbl.window);
+                logMsg(@"SKIP HIT: synthesized tap on label [%@]", t);
+                return YES;
+            }
         }
     } else if (view.accessibilityLabel.length && kwMatch(view.accessibilityLabel)) {
         if (triggerTapGesture(view)) {
             logMsg(@"SKIP HIT: triggered gesture on [%@]", view.accessibilityLabel);
+            return YES;
+        }
+        if (view.window) {
+            synthesizeTapOnView(view, view.window);
+            logMsg(@"SKIP HIT: synthesized tap on [%@]", view.accessibilityLabel);
             return YES;
         }
     }
