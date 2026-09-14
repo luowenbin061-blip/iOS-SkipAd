@@ -4,7 +4,7 @@ check_macho.py — Mach-O 结构验证脚本（复制自 trollfools-inject-dev s
 
 验证 iOS 15+ 可注入 dylib 的必备结构：
   1. LC_DYLD_CHAINED_FIXUPS (0x80000034) 存在   —— 缺则 dyld 静默拒绝
-  2. __init_offsets 段存在                      —— lld 新结构标记
+  2. __init_offsets 段存在（lld-only 优化，Apple ld64 不生成，非必需，仅 WARN）
   3. __mod_init_func 指针含 image base          —— 缺则 constructor 跳错地址 SIGILL
   4. __LINKEDIT filesize 覆盖文件末尾           —— 否则重签后尾部数据丢失
 
@@ -93,8 +93,7 @@ def main(path):
     if r["has_init_offsets"]:
         print("  [PASS] __init_offsets section present")
     else:
-        print("  [WARN] missing __init_offsets - check toolchain (lld expected)")
-        ok = False
+        print("  [WARN] missing __init_offsets - lld-only optimization; Apple ld64 (Xcode) does not emit it, NOT required for injection")
 
     if r["mod_init"] and r["seg_text"]:
         vmaddr, size = r["mod_init"]
